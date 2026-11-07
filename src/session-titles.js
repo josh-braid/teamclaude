@@ -232,7 +232,7 @@ function lastTitle(lines) {
 /**
  * @param {unknown} value
  */
-function isSessionId(value) {
+export function isSessionId(value) {
   return typeof value === 'string' && SESSION_ID.test(value);
 }
 

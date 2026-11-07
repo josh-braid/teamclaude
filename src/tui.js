@@ -17,12 +17,18 @@ import { resolveMaxUsage, resolveMaxSpendMinor, switchThresholdDiffs, modelLabel
 import { parseProxyUrl, proxyToUrl, describeProxy, describeSelfProxy, resolveUpstreamProxy, setUpstreamProxy, getUpstreamProxy, localListener, isSelfProxy } from './upstream-proxy.js';
 import { describeRouting, parseRoutingUrl, routingToUrl, checkRouting } from './account-routing.js';
 import { sanitizeText, safeLine } from './safe-text.js';
+import { flattenSessions, levelTag, activityText, moveSelection } from './session-screen.js';
 // The setting rules live in one module; the CLI, the MCP tools and this screen
 // all read them from there, so they cannot drift apart (#426).
 import { MAX_PROBE_SECONDS, ROUTE_COLORS } from './config-ops.js';
 import { isLocalUpstream } from './provider.js';
 import { hyperlink, clipboardSequence } from './osc.js';
 /** @typedef {import('./login-flow.js').LoginPrompt} LoginPrompt */
+/**
+ * What the sessions screen reads and drives: the scheduler's status (null when
+ * it is off) and a way to set a session's level (null clears it).
+ * @typedef {{ snapshot: () => any, setPriority: (id: string, level: 1|2|3|null) => Promise<void> }} SessionControl
+ */
 
 // ── ANSI helpers ─────────────────────────────────────────────
 
@@ -757,6 +763,11 @@ export class TUI {
     // Names the activity column against the session id the client sent. Absent
     // or disabled leaves every row showing the short id.
     sessionTitles = null,
+    // The priority scheduler's sessions, for the sessions screen: a snapshot of
+    // its status (null when it is off) and a way to set a session's level.
+    // In-process it is the server's own scheduler; attached, the server's
+    // status and control endpoint.
+    sessionControl = /** @type {SessionControl | null} */ (null),
     // How the header names this build, and whether a newer release is known.
     // In attach mode the account manager carries the server's own answer and
     // these are unused; the empty defaults keep the label hidden until it does.
@@ -783,12 +794,16 @@ export class TUI {
     this._testRouting = testRouting;
     this._activityStream = null;
     this.sessionTitles = sessionTitles;
+    this.sessionControl = sessionControl;
+    /** The session the sessions screen's cursor is on, by id so a refresh that
+     *  reorders the tree does not move it. @type {string | null} */
+    this.sessSel = null;
     this.versionLabel = versionLabel;
     this.updateAvailable = updateAvailable;
 
     this.log = [];           // completed activity entries
     this.active = new Map(); // in-flight requests
-    this.mode = 'normal';    // normal | select | add | input | settings | pick | login
+    this.mode = 'normal';    // normal | select | add | input | settings | pick | login | sessions
     this.pick = null;        // active list picker (routes editor accounts/bucket/color)
     this.pickReturn = 'routes'; // mode to fall back to when the picker closes
     this.selAction = null;   // switch | remove | toggle | reorder | routing
@@ -1226,6 +1241,7 @@ export class TUI {
       case 'input':  this._keyInput(k); break;
       case 'settings': this._keySettings(k); break;
       case 'routes': this._keyRoutes(k); break;
+      case 'sessions': this._keySessions(k); break;
       case 'pick': this._keyPick(k); break;
       case 'blocklist': this._keyBlocklist(k); break;
       case 'login': this._keyLogin(k); break;
@@ -1241,6 +1257,7 @@ export class TUI {
       this.mode = 'select'; this.selAction = 'switch'; this.selIdx = Math.max(0, this.am.currentIndex); this.selRoute = null; this.selReturn = 'normal';
     }
     else if (k === 'R') { this._doSync(); }
+    else if (k === 'a' && this.sessionControl) { this.mode = 'sessions'; }
     // The keys below all edit local state or call out to Anthropic, neither of
     // which attach mode can do — the server owns both.
     else if (this.remote) { /* nothing else is available here */ }
@@ -2577,6 +2594,11 @@ export class TUI {
       lines.push(...this._viewport(body, selLine - headerH, H - footerH - headerH));
     } else if (view === 'routes') {
       this._renderRoutes(lines);
+    } else if (view === 'sessions') {
+      const selLine = this._renderSessions(lines);
+      const headerH = 2;
+      const body = lines.splice(headerH);
+      lines.push(...this._viewport(body, selLine - headerH, H - footerH - headerH));
     } else if (view === 'pick') {
       this._renderPick(lines);
     } else if (view === 'blocklist') {
@@ -3732,6 +3754,80 @@ export class TUI {
     }
   }
 
+  // ── sessions screen ────────────────────────────────
+
+  _sessionRows() {
+    const st = this.sessionControl?.snapshot();
+    return { st, rows: st && Array.isArray(st.sessions) ? flattenSessions(st.sessions) : [] };
+  }
+
+  /** @param {string} k */
+  _keySessions(k) {
+    const { rows } = this._sessionRows();
+    // Settle the cursor first: a key can arrive before the screen has drawn.
+    this.sessSel = moveSelection(rows, this.sessSel, 0);
+    if (k === 'up' || k === 'k') this.sessSel = moveSelection(rows, this.sessSel, -1);
+    else if (k === 'down' || k === 'j') this.sessSel = moveSelection(rows, this.sessSel, +1);
+    else if ((k === '1' || k === '2' || k === '3' || k === '0') && this.sessSel) {
+      this._setSessionPriority(this.sessSel, k === '0' ? null : /** @type {1|2|3} */ (Number(k)));
+    }
+    else if (k === 'esc' || k === 'q') this.mode = 'normal';
+  }
+
+  /**
+   * @param {string} id
+   * @param {1|2|3|null} level
+   */
+  _setSessionPriority(id, level) {
+    const control = this.sessionControl;
+    if (!control) return;
+    const shown = this._sessionTag(id);
+    control.setPriority(id, level).then(
+      () => { this._addLog(level == null ? `Session ${shown}: priority cleared` : `Session ${shown}: priority set to P${level}`); this.render(); },
+      (/** @type {any} */ err) => { this._addLog(`Session ${shown}: could not set priority (${err?.message ?? err})`); this.render(); },
+    );
+  }
+
+  /**
+   * Every session the scheduler has seen, as a tree: each one's subagents, then
+   * the sessions it launched. Returns the cursor's line.
+   * @param {string[]} lines
+   */
+  _renderSessions(lines) {
+    const { st, rows } = this._sessionRows();
+    lines.push('');
+    if (!st) {
+      lines.push(yellow('  The scheduler is off. Set scheduler.enabled in the config to see sessions and set their priority.'));
+      return lines.length - 1;
+    }
+    const pace = typeof st.pace?.tokensPerMinute === 'number' ? ` · ${Math.round(st.pace.tokensPerMinute).toLocaleString('en-US')} tok/min` : '';
+    lines.push(bold('  Sessions') + dim(`  — scheduler ${safeLine(st.mode, 16)}${pace} · sessions with no level of their own run at their parent's, else P${st.defaultPriority}`));
+    lines.push('');
+    this.sessSel = moveSelection(rows, this.sessSel, 0);
+    let selLine = lines.length;
+    if (!rows.length) lines.push(gray('    No Claude Code sessions yet.'));
+    for (const row of rows) {
+      const indent = '  '.repeat(row.depth);
+      if (row.kind === 'agent') {
+        const a = row.agent;
+        lines.push(dim(`       ${indent}↳ ${safeLine(a.type ?? 'subagent', 24)} ${safeLine(a.id, 8)}  ${activityText(a)}`));
+        continue;
+      }
+      const n = row.node;
+      const sel = n.id === this.sessSel;
+      if (sel) selLine = lines.length;
+      const title = this.sessionTitles?.get(n.id);
+      const shortId = safeLine(n.id, 8);
+      const name = title ? `${safeLine(title, 32)} ${dim(shortId)}` : shortId;
+      const cwd = typeof n.cwd === 'string' ? safeLine(n.cwd.split('/').filter(Boolean).pop() || n.cwd, 24) : '';
+      const tag = rpad(levelTag(n), 13);
+      const colored = n.level === 1 ? red(bold(tag)) : n.level === 3 ? gray(tag) : tag;
+      const branch = row.depth ? dim('└ ') : '';
+      lines.push(`   ${sel ? cyan('▸') : ' '} ${indent}${branch}${colored} ${sel ? bold(name) : name}${cwd ? dim('  ' + cwd) : ''}  ${dim(activityText(n))}`);
+    }
+    return selLine;
+  }
+
   _renderRoutes(lines) {
     const routes = this.config.routes || [];
     lines.push('');
@@ -3764,10 +3860,14 @@ export class TUI {
 
   _renderFooter() {
     switch (this.mode) {
-      case 'normal':
+      case 'normal': {
+        const agents = this.sessionControl ? `${bold('a')}gents  ` : '';
         return this.remote
-          ? ` ${bold('s')}witch  ${bold('R')}eload  ${bold('q')}uit`
-          : ` ${bold('s')}witch  ${bold('d')}isable  ${this.loginAccount ? `${bold('l')}ogin  ` : ''}${bold('p')}robe quota  ${bold('R')}eload  ${bold('g')} settings  ${bold('q')}uit`;
+          ? ` ${bold('s')}witch  ${agents}${bold('R')}eload  ${bold('q')}uit`
+          : ` ${bold('s')}witch  ${bold('d')}isable  ${this.loginAccount ? `${bold('l')}ogin  ` : ''}${bold('p')}robe quota  ${agents}${bold('R')}eload  ${bold('g')} settings  ${bold('q')}uit`;
+      }
+      case 'sessions':
+        return ` ${dim('↑↓')} select  ${bold('1')}/${bold('2')}/${bold('3')} set priority  ${bold('0')} clear (inherit)  ${bold('Esc')} back`;
       case 'settings':
         return ` ${dim('↑↓')} navigate  ${dim('←→')} change  ${bold('Enter')} edit  ${bold('Esc')} back`;
       case 'routes':

@@ -176,11 +176,14 @@ test('disabled, nothing is held and nothing is reported', async () => {
   assert.equal(fs.quotaView(), null);
 });
 
-test('priority comes from the operator override, then the header, then the default', () => {
+test('priority comes from the operator override, then the session\'s own header, then the default', async () => {
   const { fs } = fleet({ config: { defaultPriority: 3 } });
+  fs.peerLookup = async () => null;
+  assert.equal(fs.levelFor(null, '1'), 1, 'a request with no session goes by its header');
+  assert.equal(fs.levelFor(null, 'bogus'), 3);
   assert.equal(fs.levelFor('s1', undefined), 3);
+  (await fs.track('s1', {}, null, '1')).done();
   assert.equal(fs.levelFor('s1', '1'), 1);
-  assert.equal(fs.levelFor('s1', 'bogus'), 3);
   fs.setSessionPriority('s1', 2);
   assert.equal(fs.levelFor('s1', '1'), 2);
   fs.setSessionPriority('s1', null);

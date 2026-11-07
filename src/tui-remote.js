@@ -83,6 +83,15 @@ export class RemoteControl {
   }
 
   /**
+   * Set a session's priority on the running server, or with null clear it.
+   * @param {string} sessionId
+   * @param {1 | 2 | 3 | null} priority
+   */
+  setSessionPriority(sessionId, priority) {
+    return this._action('POST', '/teamclaude/session-priority', { sessionId, priority });
+  }
+
+  /**
    * A call that changes something on the server.
    *
    * The control plane confirms an applied action with `ok: true`. A 200 carrying
@@ -401,6 +410,10 @@ export function createAttachSession({ control, config, onQuit, pollMs = DEFAULT_
     saveConfig: async () => { throw new Error('attach mode cannot write config'); },
     syncAccounts: async () => (await control.reload())?.added || 0,
     applySwitch: name => control.switchAccount(name),
+    sessionControl: {
+      snapshot: () => am.status?.scheduler ?? null,
+      setPriority: async (/** @type {string} */ id, /** @type {1|2|3|null} */ level) => { await control.setSessionPriority(id, level); },
+    },
     onQuit: () => { stop(); onQuit?.(); },
   });
 

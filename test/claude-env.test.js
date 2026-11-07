@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import { spawnSync } from 'node:child_process';
 import assert from 'node:assert/strict';
-import { buildClaudeEnvLines, bypassesAllHosts, clearSelfProxyEnvLines, clientHoldSeconds, localLoginHint, mergeNoProxy, resolveClientMode, takePriorityFlag, withPriorityHeader } from '../src/claude-env.js';
+import { buildClaudeEnvLines, bypassesAllHosts, clearSelfProxyEnvLines, clientHoldSeconds, localLoginHint, mergeNoProxy, resolveClientMode, takePriorityFlag, launchHeaders, launchParent } from '../src/claude-env.js';
 
 test('MITM mode (default) emits proxy vars + CA cert, and clears ANTHROPIC_BASE_URL', () => {
   const lines = buildClaudeEnvLines({ port: 3456, caPath: '/home/u/.config/teamclaude-ca.pem' });
@@ -220,9 +220,23 @@ test('takePriorityFlag reads --priority N and --priority=N and leaves the rest',
   assert.match(String(takePriorityFlag(['--priority']).error), /1, 2 or 3/);
 });
 
-test('withPriorityHeader replaces an earlier priority and keeps other headers', () => {
-  assert.equal(withPriorityHeader(undefined, 2), 'x-teamclaude-priority: 2');
-  assert.equal(withPriorityHeader('X-Team: a\nX-TeamClaude-Priority: 3\n', 1), 'X-Team: a\nx-teamclaude-priority: 1');
+test('launchHeaders replaces the teamclaude headers and keeps the caller\'s', () => {
+  const parent = '11111111-2222-3333-4444-555555555555';
+  assert.equal(launchHeaders(undefined, { priority: 2, parent: null }), 'x-teamclaude-priority: 2\nx-teamclaude-parent-session: -');
+  assert.equal(launchHeaders('X-Team: a\nX-TeamClaude-Priority: 3\nx-teamclaude-parent-session: -\n', { priority: 1, parent }),
+    `X-Team: a\nx-teamclaude-priority: 1\nx-teamclaude-parent-session: ${parent}`);
+});
+
+test('launchHeaders drops an inherited priority when none is given, so the session inherits its parent\'s live', () => {
+  const parent = '11111111-2222-3333-4444-555555555555';
+  assert.equal(launchHeaders('X-Team: a\nx-teamclaude-priority: 1\nx-teamclaude-parent-session: -', { priority: null, parent }),
+    `X-Team: a\nx-teamclaude-parent-session: ${parent}`);
+});
+
+test('launchParent reads the launching session from CLAUDE_CODE_SESSION_ID, and nothing else', () => {
+  assert.equal(launchParent({ CLAUDE_CODE_SESSION_ID: '11111111-2222-3333-4444-555555555555' }), '11111111-2222-3333-4444-555555555555');
+  assert.equal(launchParent({ CLAUDE_CODE_SESSION_ID: 'not-a-session\nx-evil: 1' }), null);
+  assert.equal(launchParent({}), null);
 });
 
 test('clientHoldSeconds covers the scheduler hold only when the scheduler is on', () => {
@@ -235,7 +249,7 @@ test('clientHoldSeconds covers the scheduler hold only when the scheduler is on'
 
 test('buildClaudeEnvLines sets the priority header and keeps TC_PRIORITY out of the child', () => {
   const lines = buildClaudeEnvLines({ port: 3456, useMitm: false, priority: 1, inheritedCustomHeaders: 'X-Team: a' });
-  assert.ok(lines.includes(`export ANTHROPIC_CUSTOM_HEADERS='X-Team: a\nx-teamclaude-priority: 1'`), lines.join('\n'));
+  assert.ok(lines.includes(`export ANTHROPIC_CUSTOM_HEADERS='X-Team: a\nx-teamclaude-priority: 1\nx-teamclaude-parent-session: -'`), lines.join('\n'));
   assert.ok(lines.includes('unset TC_PRIORITY'));
   const none = buildClaudeEnvLines({ port: 3456, useMitm: false });
   assert.ok(!none.some(l => /CUSTOM_HEADERS|TC_PRIORITY/.test(l)));

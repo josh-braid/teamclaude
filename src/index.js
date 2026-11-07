@@ -47,8 +47,8 @@ import { renderStatus, formatPercent } from './status-renderer.js';
 import { sanitizeText, safeLine } from './safe-text.js';
 import { modelLabel } from './model.js';
 import { ClientUsageTracker, UsageDimensionTracker } from './client-usage.js';
-import { buildClaudeEnvLines, bypassesAllHosts, clearSelfProxyEnvLines, clientHoldSeconds, encodePinComponent, LOCAL_LOGIN_HINT_WINDOW_MS, localLoginHint, mergeNoProxy, parsePriority, resolveClientMode, takePriorityFlag, withPriorityHeader } from './claude-env.js';
-import { resolveSchedulerConfig } from './fleet-scheduler.js';
+import { buildClaudeEnvLines, bypassesAllHosts, clearSelfProxyEnvLines, clientHoldSeconds, encodePinComponent, LOCAL_LOGIN_HINT_WINDOW_MS, localLoginHint, mergeNoProxy, launchHeaders, launchParent, parsePriority, resolveClientMode, takePriorityFlag } from './claude-env.js';
+import { FleetScheduler, resolveSchedulerConfig } from './fleet-scheduler.js';
 import { serviceKind, installService, uninstallService, serviceStatus, renderService, logPath } from './service.js';
 import { formatTerminalTitle, titleSequence, TITLE_STACK_PUSH, TITLE_STACK_POP } from './terminal-title.js';
 import { getUpstreamProxy, describeProxy, describeSelfProxy, localListener, isSelfProxy } from './upstream-proxy.js';
@@ -387,13 +387,17 @@ async function serverCommand() {
   }
   // Fatal for the same reason: a typo in the scheduler block would otherwise
   // leave it running its defaults, or off, with nothing saying why.
+  /** @type {import('./fleet-scheduler.js').SchedulerConfig} */
+  let schedulerConfig;
   try {
-    resolveSchedulerConfig(config.scheduler);
+    schedulerConfig = resolveSchedulerConfig(config.scheduler);
   } catch (/** @type {any} */ err) {
     console.error(`[TeamClaude] Bad scheduler setting in ${getConfigPath()}: ${err.message}`);
     process.exit(1);
   }
   const accountManager = new AccountManager(accounts, threshold, { routes: config.routes, ramp: config.stormRamp, distributeSessions: config.distributeSessions, expiryRouting: config.expiryRouting, advisorEligibility: config.advisorEligibility, adaptive, listener: localListener(config) });
+  // One scheduler for the proxy and the TUI's sessions screen.
+  const scheduler = new FleetScheduler({ config: schedulerConfig, accountManager });
   // Names the activity log's session column from Claude Code's own on-disk
   // session titles. Built whether or not the TUI runs, so a reload has one
   // object to reconfigure.
@@ -734,6 +738,10 @@ async function serverCommand() {
   if (useTUI) {
     tui = new TUI({
       accountManager, config, sx, activityLogPath, sessionTitles, versionLabel, updateAvailable,
+      sessionControl: {
+        snapshot: () => (scheduler.enabled ? scheduler.status() : null),
+        setPriority: async (/** @type {string} */ id, /** @type {1|2|3|null} */ level) => { scheduler.setSessionPriority(id, level); },
+      },
       saveConfig: () => atomicConfigUpdate(async diskConfig => {
         mergeAccountsOnto(diskConfig);
         // Persist sx.org settings (set/cleared from the TUI settings screen).
@@ -954,7 +962,7 @@ async function serverCommand() {
   // Shared with the listener (drain.js): POST /teamclaude/drain flips it, and a graceful
   // shutdown waits on the same in-flight count.
   const drain = createDrainState();
-  const server = createProxyServer(accountManager, config, hooks, sx, clientUsage, dimensionUsage, { bindHost, drain });
+  const server = createProxyServer(accountManager, config, hooks, sx, clientUsage, dimensionUsage, { bindHost, drain, scheduler });
   // Said once, at start: a value that is set but cannot turn the drain on would otherwise
   // leave SIGTERM stopping at once with nothing to say why.
   const rawDrain = config.proxy?.drainTimeoutSeconds;
@@ -1556,7 +1564,7 @@ async function envCommand() {
     lines = buildClaudeEnvLines({
       port, useMitm, caPath, holdSeconds: clientHoldSeconds(config),
       account, proxyApiKey: config.proxy?.apiKey || '',
-      priority, inheritedCustomHeaders: process.env.ANTHROPIC_CUSTOM_HEADERS || null,
+      priority, inheritedCustomHeaders: process.env.ANTHROPIC_CUSTOM_HEADERS || null, parent: launchParent(process.env),
       // The shell doing the eval keeps its own NO_PROXY entries; re-running is
       // idempotent, since the merged value is what it will have next time.
       inheritedNoProxy: [process.env.NO_PROXY, process.env.no_proxy].filter(Boolean).join(','),
@@ -1641,12 +1649,14 @@ async function runCommand() {
   const tcAcct = (process.env.TC_ACCT || '').trim();
   delete env.TC_ACCT;
   delete env.TC_PRIORITY;
-  if (priority != null) env.ANTHROPIC_CUSTOM_HEADERS = withPriorityHeader(env.ANTHROPIC_CUSTOM_HEADERS, priority);
   // Legacy: a caller-supplied ANTHROPIC_BASE_URL of http://<this proxy>/tc-acct/…
   // also pins (shipped in 1.1.10). TC_ACCT is the supported way now — it works in
   // MITM mode too, and keeps the pin out of the API path.
   const pinnedBase = isLocalAccountPin(process.env.ANTHROPIC_BASE_URL, port);
   if (await isProxyUp(port)) {
+    // Rewritten at every launch (see launchHeaders), and only toward the proxy,
+    // which strips them: a direct launch would send them to Anthropic.
+    env.ANTHROPIC_CUSTOM_HEADERS = launchHeaders(env.ANTHROPIC_CUSTOM_HEADERS, { priority, parent: launchParent(process.env) });
     if (useMitm) {
       // Route ALL of claude's traffic through us as an HTTPS forward proxy, so
       // even hardcoded api.anthropic.com endpoints (e.g. the design MCP) get the

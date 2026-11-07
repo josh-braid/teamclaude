@@ -1,3 +1,5 @@
+import { isSessionId } from './session-titles.js';
+
 // Percent-encode an account name (or key) for a URL, leaving ONLY the unreserved
 // set. encodeURIComponent alone is not enough here: it passes `( ) ' ! *`
 // through untouched, and these lines are emitted as unquoted shell `export`
@@ -170,8 +172,9 @@ export function clearSelfProxyEnvLines(port, env = process.env) {
  * @param {string|null} [opts.inheritedNoProxy]
  * @param {1|2|3|null} [opts.priority]  the scheduler level to ask for
  * @param {string|null} [opts.inheritedCustomHeaders]  the shell's ANTHROPIC_CUSTOM_HEADERS, kept
+ * @param {string|null} [opts.parent]  the session this shell was launched from (launchParent)
  */
-export function buildClaudeEnvLines({ port, useMitm = true, caPath = null, holdSeconds = 0, account = null, proxyApiKey = '', inheritedNoProxy = null, priority = null, inheritedCustomHeaders = null }) {
+export function buildClaudeEnvLines({ port, useMitm = true, caPath = null, holdSeconds = 0, account = null, proxyApiKey = '', inheritedNoProxy = null, priority = null, inheritedCustomHeaders = null, parent = null }) {
   const lines = [];
   const pin = (account || '').trim();
   // The port is interpolated unquoted into URLs the shell evals, so it has to
@@ -208,7 +211,7 @@ export function buildClaudeEnvLines({ port, useMitm = true, caPath = null, holdS
   // The priority rides as a request header; TC_PRIORITY itself stays out of
   // the child, like TC_ACCT.
   if (priority != null) {
-    lines.push(`export ANTHROPIC_CUSTOM_HEADERS=${shellQuote(withPriorityHeader(inheritedCustomHeaders ?? undefined, priority))}`);
+    lines.push(`export ANTHROPIC_CUSTOM_HEADERS=${shellQuote(launchHeaders(inheritedCustomHeaders ?? undefined, { priority, parent }))}`);
     lines.push('unset TC_PRIORITY');
   }
 
@@ -220,8 +223,10 @@ export function buildClaudeEnvLines({ port, useMitm = true, caPath = null, holdS
   return lines;
 }
 
-// The header the proxy's priority scheduler reads (server.js PRIORITY_HEADER).
+// The headers the proxy's scheduler reads (server.js PRIORITY_HEADER and
+// PARENT_HEADER).
 const PRIORITY_HEADER_NAME = 'x-teamclaude-priority';
+const PARENT_HEADER_NAME = 'x-teamclaude-parent-session';
 
 /**
  * A `--priority N` / `--priority=N` flag taken out of `run`'s arguments.
@@ -257,16 +262,35 @@ export function parsePriority(raw) {
 }
 
 /**
- * Claude Code's ANTHROPIC_CUSTOM_HEADERS (one `Name: Value` per line) with the
- * priority header set to `level`, replacing any earlier one and keeping every
- * other header the caller set.
+ * Claude Code's ANTHROPIC_CUSTOM_HEADERS (one `Name: Value` per line) with
+ * teamclaude's launch headers replaced and every other header kept.
+ *
+ * Everything a session launches inherits this variable, so both headers are
+ * rewritten at each launch rather than passed down: the parent claim names the
+ * session this one was launched from (`-` for none), and the priority header is
+ * sent only when this launch asks for a level. An inherited priority is
+ * dropped, so a session given none follows its parent's level live.
  * @param {string | undefined} existing
- * @param {1 | 2 | 3} level
+ * @param {{ priority: 1 | 2 | 3 | null, parent: string | null }} launch
  */
-export function withPriorityHeader(existing, level) {
+export function launchHeaders(existing, { priority, parent }) {
+  const ours = new Set([PRIORITY_HEADER_NAME, PARENT_HEADER_NAME]);
   const kept = String(existing || '').split('\n')
-    .filter(line => line.trim() && line.split(':')[0].trim().toLowerCase() !== PRIORITY_HEADER_NAME);
-  return [...kept, `${PRIORITY_HEADER_NAME}: ${level}`].join('\n');
+    .filter(line => line.trim() && !ours.has(line.split(':')[0].trim().toLowerCase()));
+  if (priority != null) kept.push(`${PRIORITY_HEADER_NAME}: ${priority}`);
+  kept.push(`${PARENT_HEADER_NAME}: ${parent ?? '-'}`);
+  return kept.join('\n');
+}
+
+/**
+ * The Claude Code session this process was launched from: Claude Code sets
+ * CLAUDE_CODE_SESSION_ID for everything it starts. Null outside a session, or
+ * when the value is not a session id (it goes into a header).
+ * @param {Record<string, string | undefined>} env
+ */
+export function launchParent(env) {
+  const id = env.CLAUDE_CODE_SESSION_ID;
+  return isSessionId(id) ? /** @type {string} */ (id) : null;
 }
 
 /**

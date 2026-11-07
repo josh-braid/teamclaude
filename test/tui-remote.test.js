@@ -452,7 +452,7 @@ test('on loopback a 401 blames the port, not the key the server never checks', a
 test('keys that would need write endpoints are inert in attach mode', async (t) => {
   const { tui, am, seen } = await makeSession(t);
   am.applyStatus(statusFixture());
-  for (const k of ['g', 'd', 'p', 'a', 'r']) tui._key(k);
+  for (const k of ['g', 'd', 'p', 'r']) tui._key(k);
   await nothingHappens();
   assert.equal(tui.mode, 'normal');
   assert.deepEqual(tui.log, []);
@@ -795,4 +795,77 @@ test('a reply under the cap is read whole', async (t) => {
   const { control } = await makeSession(t, { routes: { 'GET /teamclaude/status': json(big) } });
   const status = await control.status();
   assert.equal(status.note.length, 200 * 1024);
+});
+
+// ── sessions screen ──────────────────────────────────────────
+
+const SID_P = '11111111-1111-4111-8111-111111111111';
+const SID_K = '22222222-2222-4222-8222-222222222222';
+
+/** A scheduler status block with a parent session, its subagent, and a child it launched. */
+function schedulerFixture() {
+  const base = { headersInherited: false, pid: null, requests: 3, inFlight: 0, held: 0, agents: [], children: [] };
+  return {
+    enabled: true, mode: 'paced', defaultPriority: 2, pace: { tokensPerMinute: 12_000 },
+    sessions: [{
+      ...base, id: SID_P, parent: null, level: 1, source: 'set', cwd: '/home/u/fusion', idleMs: 1000, inFlight: 1,
+      agents: [{ id: 'a4f61c8096b414dc6', type: 'Explore\u001b[2J', idleMs: 0, requests: 2, inFlight: 1, agents: [] }],
+      children: [{ ...base, id: SID_K, parent: SID_P, level: 1, source: 'inherited', from: SID_P, cwd: '/home/u/w\u001b]0;evil\u0007', idleMs: 5000 }],
+    }],
+  };
+}
+
+test('a opens the sessions screen in attach mode, drawing the tree safely', async (t) => {
+  const { tui, am } = await makeSession(t);
+  am.applyStatus(statusFixture({ scheduler: schedulerFixture() }));
+  tui._key('a');
+  assert.equal(tui.mode, 'sessions');
+  /** @type {string[]} */
+  const lines = [];
+  tui._renderSessions(lines);
+  const text = lines.join('\n');
+  assert.match(text, /P1 set .*11111111.*fusion.*running 1/);
+  assert.match(text, /↳ Explore/);
+  assert.match(text, /└ .*P1 inherited.*22222222/);
+  assert.doesNotMatch(text, /\u001b\[2J|\u001b\]0;/, 'nothing the server sends reaches the terminal as a control sequence');
+  tui._key('esc');
+  assert.equal(tui.mode, 'normal');
+});
+
+test('a number key sets the selected session\'s priority on the server, and 0 clears it', async (t) => {
+  const { tui, am, seen } = await makeSession(t, {
+    routes: {
+      'GET /teamclaude/status': json(statusFixture()),
+      'POST /teamclaude/session-priority': json({ ok: true }),
+    },
+  });
+  am.applyStatus(statusFixture({ scheduler: schedulerFixture() }));
+  tui._key('a');
+  tui._key('down');
+  tui._key('3');
+  await logged(tui);
+  assert.deepEqual(JSON.parse(seen.at(-1).body), { sessionId: SID_K, priority: 3 });
+  assert.match(tui.log.at(-1).msg, /P3/);
+  tui._key('0');
+  await new Promise(r => setTimeout(r, 50));
+  assert.deepEqual(JSON.parse(seen.at(-1).body), { sessionId: SID_K, priority: null });
+});
+
+test('a refused priority change is reported, not shown as done', async (t) => {
+  const { tui, am } = await makeSession(t);   // no session-priority route: 404
+  am.applyStatus(statusFixture({ scheduler: schedulerFixture() }));
+  tui._key('a');
+  tui._key('1');
+  await logged(tui);
+  assert.match(tui.log.at(-1).msg, /could not set priority/);
+});
+
+test('with the scheduler off, the sessions screen says how to turn it on', async (t) => {
+  const { tui, am } = await makeSession(t);
+  am.applyStatus(statusFixture());
+  tui._key('a');
+  /** @type {string[]} */
+  const lines = [];
+  tui._renderSessions(lines);
+  assert.match(lines.join('\n'), /scheduler is off.*scheduler\.enabled/);
 });

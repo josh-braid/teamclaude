@@ -275,6 +275,16 @@ export class Scheduler {
     };
   }
 
+  /** How many requests each session has waiting. */
+  waitingBySession() {
+    /** @type {Map<string, number>} */
+    const out = new Map();
+    for (const level of /** @type {const} */ ([2, 3])) {
+      for (const w of this.queues[level]) out.set(w.session, (out.get(w.session) ?? 0) + 1);
+    }
+    return out;
+  }
+
   // ── internals ─────────────────────────────────────────────────────────────
 
   /** @returns {Mode} */

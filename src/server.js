@@ -23,6 +23,7 @@ import { tunnelTls } from './sx.js';
 import { createEgressGuard } from './egress-guard.js';
 import { FleetScheduler, resolveSchedulerConfig } from './fleet-scheduler.js';
 import { parseLevel } from './scheduler.js';
+import { PARENT_HEADER } from './session-graph.js';
 import { createDrainState, DRAIN_RETRY_AFTER_SECONDS } from './drain.js';
 import { isRoutingFailure, describeRouting } from './account-routing.js';
 import { safeLine } from './safe-text.js';
@@ -620,14 +621,17 @@ export function callerView(client, scope) {
  * @param {any} [sx]
  * @param {any} [clientUsage]
  * @param {any} [dimensionUsage]
- * @param {{ bindHost?: string|null, drain?: import('./drain.js').DrainState|null }} [opts]  `bindHost`: the address the caller
+ * @param {{ bindHost?: string|null, drain?: import('./drain.js').DrainState|null,
+ *           scheduler?: import('./fleet-scheduler.js').FleetScheduler|null }} [opts]  `bindHost`: the address the caller
  *   binds, when it is not `config.proxy.host` (TEAMCLAUDE_HOST overrides it). The
  *   DNS-rebinding Host check accepts that address as naming this machine; given
  *   only the config value, a server bound off-box through the env var refused a
  *   key-less caller naming the very address it listens on (#423). `drain`: the drain state the caller
  *   also holds (drain.js), so a graceful shutdown waits on the same count the listener keeps.
+ *   `scheduler`: the priority scheduler the caller also holds, so the TUI's sessions screen
+ *   reads and sets the one this server admits by; built from `config.scheduler` when absent.
  */
-export function createProxyServer(accountManager, config, hooks = {}, sx = null, clientUsage = null, dimensionUsage = null, { bindHost = null, drain: sharedDrain = null } = {}) {
+export function createProxyServer(accountManager, config, hooks = {}, sx = null, clientUsage = null, dimensionUsage = null, { bindHost = null, drain: sharedDrain = null, scheduler: sharedScheduler = null } = {}) {
   const boundHost = () => bindHost || config.proxy?.host;
   const drain = sharedDrain ?? createDrainState();
   const upstream = config.upstream || 'https://api.anthropic.com';
@@ -1258,7 +1262,7 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
   // The priority scheduler (fleet-scheduler.js), shared by the base listener and
   // the MITM one so both draw on one pace. Off unless config.scheduler.enabled;
   // a bad block is refused at startup (index.js), before this is reached.
-  const scheduler = new FleetScheduler({ config: resolveSchedulerConfig(config.scheduler), accountManager });
+  const scheduler = sharedScheduler ?? new FleetScheduler({ config: resolveSchedulerConfig(config.scheduler), accountManager });
   const forward = createProxyRequestListener({ accountManager, upstream, logDir, hooks, sx, holdMs, config, egress, clientUsage, dimensionUsage, drain, scheduler });
   const server = http.createServer(requestHandler);
   server.keepAliveTimeout = KEEP_ALIVE_TIMEOUT_MS;
@@ -2106,8 +2110,9 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       // internal project and branch names to Anthropic for no benefit, so they
       // are dropped with the other proxy-control headers.
       const stripHeaders = usageDimensionHeaderNames(config.proxy);
-      // Ours too: it tells this proxy's scheduler, not Anthropic, what to do.
+      // Ours too: they tell this proxy's scheduler, not Anthropic, what to do.
       stripHeaders.add(PRIORITY_HEADER);
+      stripHeaders.add(PARENT_HEADER);
 
       // stripOverage, synthesizeQuota and poolQuota are sampled once here, at dispatch:
       // retries and holds of this request keep them, and a reload applies to
@@ -2143,10 +2148,13 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       if (clientGone(res)) onRequestClose();
       /** @type {import('./fleet-scheduler.js').Admission | null} */
       let admission = null;
+      /** @type {{ done: () => void } | null} */
+      let tracked = null;
       try {
         // The priority scheduler: an Anthropic completion waits here until the
         // fleet's pace admits it. Nothing is held when it is off.
         if (scheduler?.enabled && !urlPinned && provider === DEFAULT_PROVIDER && isCompletionPath(classifiedPath)) {
+          if (sessionId) tracked = await scheduler.track(sessionId, req.headers, req.socket, req.headers[PRIORITY_HEADER]);
           const level = scheduler.levelFor(sessionId, req.headers[PRIORITY_HEADER]);
           ctx.priority = level;
           const result = await scheduler.admit({ session: sessionId || pinKey || 'anonymous', level, bodyBytes: body.length, signal: ctx.signal });
@@ -2183,6 +2191,7 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
         }
       } finally {
         if (admission?.kind === 'admitted') scheduler?.settle(admission, ctx.usageReports || []);
+        tracked?.done();
         res.off('close', onRequestClose);
         // The signal fires only for a departure (see above), so this is the
         // status of a row whose client will never read anything. It says

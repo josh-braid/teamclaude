@@ -22,6 +22,8 @@
 import { Scheduler, fleetPace, parseLevel, DEFAULT_LEVEL } from './scheduler.js';
 import { quotaTier } from './quota-summary.js';
 import { providerOf, DEFAULT_PROVIDER } from './provider.js';
+import { SessionGraph, requestClaims, MAX_GRAPH_SESSIONS } from './session-graph.js';
+import { peerProcess } from './peer-process.js';
 
 /** @typedef {import('./scheduler.js').Level} Level */
 /** @typedef {import('./scheduler.js').Ticket} Ticket */
@@ -270,7 +272,10 @@ export function paceAccounts(accountManager, now) {
 const REFRESH_MS = 15_000;
 const SPEND_SPAN_MS = 10 * 60_000;
 const MAX_EPISODES = 20;
-const MAX_SESSION_PRIORITIES = 4096;
+// How long a session's first request waits for its process to be read.
+const LOOKUP_WAIT_MS = 250;
+
+/** @typedef {import('./session-graph.js').SessionView & { held: number, children: SessionStatus[] }} SessionStatus */
 
 /**
  * @typedef {{ kind: 'admitted', ticket: Ticket, session: string, level: Level, heldMs: number }
@@ -282,9 +287,11 @@ const MAX_SESSION_PRIORITIES = 4096;
 export class FleetScheduler {
   /**
    * @param {{ config: SchedulerConfig, accountManager: any, now?: () => number,
-   *           timers?: Timers, log?: (line: string) => void }} opts
+   *           timers?: Timers, log?: (line: string) => void,
+   *           peerLookup?: (socket: any) => Promise<import('./peer-process.js').PeerProcess | null> }} opts
+   *   peerLookup: reads the client process behind a connection (peer-process.js)
    */
-  constructor({ config, accountManager, now = Date.now, timers, log = line => console.log(line) }) {
+  constructor({ config, accountManager, now = Date.now, timers, log = line => console.log(line), peerLookup = peerProcess }) {
     this.config = config;
     this.accountManager = accountManager;
     this.now = now;
@@ -295,8 +302,10 @@ export class FleetScheduler {
     };
     this.learner = new ExchangeLearner();
     this.estimator = new CostEstimator({ cacheTtlMs: config.cacheTtlSeconds * 1000 });
-    /** @type {Map<string, Level>} */
-    this.sessionPriorities = new Map();
+    this.graph = new SessionGraph({ now });
+    this.peerLookup = peerLookup;
+    /** Each session's process lookup, run once. @type {Map<string, Promise<void>>} */
+    this.lookups = new Map();
     /** @type {Episode[]} */
     this.episodes = [];
     /** @type {Array<{ at: number, committed: number }>} */
@@ -316,15 +325,16 @@ export class FleetScheduler {
   get enabled() { return this.config.enabled; }
 
   /**
-   * The level a request runs at: the operator's override for the session, else
-   * the client's header, else the configured default.
+   * The level a request runs at: for a session, the graph's answer (its
+   * override, its own header, else the nearest ancestor's level); for a request
+   * with no session, its header. Else the configured default.
    * @param {string | null} session
    * @param {unknown} header
    * @returns {Level}
    */
   levelFor(session, header) {
-    const override = session ? this.sessionPriorities.get(session) : undefined;
-    return override ?? parseLevel(header) ?? this.config.defaultPriority;
+    if (session) return this.graph.levelOf(session, this.config.defaultPriority).level;
+    return parseLevel(header) ?? this.config.defaultPriority;
   }
 
   /**
@@ -332,13 +342,57 @@ export class FleetScheduler {
    * @param {Level | null} level null clears the override
    */
   setSessionPriority(session, level) {
-    this.sessionPriorities.delete(session);
-    if (level == null) return;
-    this.sessionPriorities.set(session, level);
-    if (this.sessionPriorities.size > MAX_SESSION_PRIORITIES) {
-      const oldest = this.sessionPriorities.keys().next().value;
-      if (oldest !== undefined) this.sessionPriorities.delete(oldest);
+    this.graph.setOverride(session, level);
+  }
+
+  /**
+   * Record one request in the session graph and count it in flight until
+   * `done`. A session's first request from a local process waits up to
+   * LOOKUP_WAIT_MS for that process to be read, so it starts at the level it
+   * inherits.
+   * @param {string} session
+   * @param {Record<string, string | string[] | undefined>} headers
+   * @param {unknown} socket the client connection, for peerProcess
+   * @param {unknown} header the priority header
+   * @returns {Promise<{ done: () => void }>}
+   */
+  async track(session, headers, socket, header) {
+    const { parentClaim, agent } = requestClaims(headers);
+    this.graph.observe(session, { parentClaim, header: parseLevel(header), agent });
+    let lookup = this.lookups.get(session);
+    if (!lookup) {
+      lookup = this.peerLookup(socket)
+        .then(found => { if (found && this.graph.node(session)) this.graph.resolveProcess(session, found); })
+        .catch(() => {});
+      this.lookups.set(session, lookup);
+      if (this.lookups.size > MAX_GRAPH_SESSIONS) this._pruneLookups();
+      /** @type {unknown} */
+      let timer = null;
+      await Promise.race([lookup, new Promise(resolve => { timer = this.timers.set(() => resolve(undefined), LOOKUP_WAIT_MS); })]);
+      this.timers.clear(timer);
     }
+    const agentId = agent?.id ?? null;
+    this.graph.start(session, agentId);
+    let open = true;
+    return { done: () => { if (open) { open = false; this.graph.finish(session, agentId); } } };
+  }
+
+  /**
+   * The session tree, each session with how many of its requests are held.
+   * @returns {SessionStatus[]}
+   */
+  sessions() {
+    const waiting = this.core.waitingBySession();
+    /** @param {import('./session-graph.js').SessionView} v @returns {SessionStatus} */
+    const withHeld = v => ({ ...v, held: waiting.get(v.id) ?? 0, children: v.children.map(withHeld) });
+    const tree = this.graph.snapshot(this.config.defaultPriority).sessions.map(withHeld);
+    this._pruneLookups();
+    return tree;
+  }
+
+  /** Drop the lookups of sessions the graph has forgotten. */
+  _pruneLookups() {
+    for (const id of this.lookups.keys()) if (!this.graph.node(id)) this.lookups.delete(id);
   }
 
   /** Recompute the pace from the current readings. */
@@ -424,7 +478,8 @@ export class FleetScheduler {
       overdrive: open && open.endedAt == null ? { since: open.startedAt, sessions: [...new Set([...open.sessions, ...core.overdriveSessions])] } : null,
       resetsAt: this.pace.horizonMs == null ? null : now + this.pace.horizonMs,
       projectedLimitAt: this._projectedLimitAt(),
-      sessionPriorities: Object.fromEntries(this.sessionPriorities),
+      sessionPriorities: Object.fromEntries(this.graph.overrides),
+      sessions: this.sessions(),
       episodes: this.episodes.map(e => ({ ...e })),
     };
   }

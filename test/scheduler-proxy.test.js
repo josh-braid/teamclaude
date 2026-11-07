@@ -41,11 +41,16 @@ function paceSource(u7d) {
   };
 }
 
-function scheduler({ u7d = 0.5, config = {} } = {}) {
+/**
+ * @param {{ u7d?: number, config?: object,
+ *           peerLookup?: (socket: unknown) => Promise<import('../src/peer-process.js').PeerProcess | null> }} [opts]
+ */
+function scheduler({ u7d = 0.5, config = {}, peerLookup = async () => null } = {}) {
   const fs = new FleetScheduler({
     config: resolveSchedulerConfig({ enabled: true, ...config }),
     accountManager: paceSource(u7d),
     log: () => {},
+    peerLookup,
   });
   fs.learner.quotaPerToken = 1e-7;
   fs.refresh();
@@ -61,11 +66,11 @@ async function proxyWith(fs, upstreamPort) {
 
 /**
  * @param {number} port
- * @param {{ priority?: string, session?: string, bytes?: number, path?: string }} [opts]
+ * @param {{ priority?: string, session?: string, bytes?: number, path?: string, extra?: Record<string, string> }} [opts]
  */
-async function post(port, { priority, session = 'sess-0001', bytes = 0, path = '/v1/messages' } = {}) {
+async function post(port, { priority, session = 'sess-0001', bytes = 0, path = '/v1/messages', extra = {} } = {}) {
   /** @type {Record<string, string>} */
-  const headers = { 'content-type': 'application/json', 'x-claude-code-session-id': session };
+  const headers = { 'content-type': 'application/json', 'x-claude-code-session-id': session, ...extra };
   if (priority) headers[PRIORITY_HEADER] = priority;
   const res = await fetch(`http://127.0.0.1:${port}${path}`, {
     method: 'POST', headers,
@@ -225,5 +230,53 @@ test('a streamed response is settled on its merged usage, cache fields included'
     assert.match(await res.text(), /message_stop/);
     // 4 + 1000 × 0.1 + 40 × 1.25 + 20 × 5
     assert.equal(fs.status().committedTokens - before, 4 + 100 + 50 + 100);
+  } finally { proxy.close(); upstream.close(); fs.close(); }
+});
+
+// ── the session tree ────────────────────────────────────────────────────────
+
+const PARENT = '11111111-1111-4111-8111-111111111111';
+const CHILD = '22222222-2222-4222-8222-222222222222';
+
+test('a session launched from another inherits its level live, and the parent header never goes upstream', async () => {
+  const { server: upstream, seen } = recordingUpstream();
+  let lookups = 0;
+  // The child's process descends from PARENT's; its inherited headers still
+  // carry the level and parent claim PARENT was launched with.
+  const fs = scheduler({
+    config: { depthSeconds: 3600 },
+    // One lookup per session, in request order: PARENT was started from a
+    // shell, CHILD by a shell inside PARENT's process.
+    peerLookup: async () => (++lookups === 1
+      ? { pid: 4241, start: 1, cwd: '/work', ancestors: [{ pid: 100, start: 1 }] }
+      : { pid: 4243, start: 1, cwd: '/work/child', ancestors: [{ pid: 4242, start: 1 }, { pid: 4241, start: 1 }] }),
+  });
+  const { proxy, port } = await proxyWith(fs, await listen(upstream));
+  try {
+    assert.equal((await post(port, { session: PARENT, priority: '1', extra: { 'x-teamclaude-parent-session': '-' } })).status, 200);
+    assert.equal((await post(port, { session: CHILD, priority: '1', extra: { 'x-teamclaude-parent-session': '-' } })).status, 200);
+    assert.equal(seen[1].headers['x-teamclaude-parent-session'], undefined);
+    const tree = () => fs.status().sessions;
+    const child = () => tree().find(s => s.id === PARENT)?.children.find(c => c.id === CHILD);
+    assert.equal(child()?.cwd, '/work/child');
+    assert.deepEqual([child()?.level, child()?.source, child()?.from], [1, 'inherited', PARENT]);
+    fs.setSessionPriority(PARENT, 3);
+    assert.deepEqual([child()?.level, child()?.source], [3, 'inherited']);
+  } finally { proxy.close(); upstream.close(); fs.close(); }
+});
+
+test('subagents show under their session, and the tree counts requests and in-flight work', async () => {
+  const { server: upstream } = recordingUpstream();
+  const fs = scheduler({ config: { depthSeconds: 3600 } });
+  const { proxy, port } = await proxyWith(fs, await listen(upstream));
+  try {
+    await post(port, { session: PARENT });
+    await post(port, { session: PARENT, extra: { 'x-claude-code-request-class': 'subagent', 'x-claude-code-agent-id': 'a1', 'x-claude-code-agent-type': 'Explore' } });
+    const [root] = fs.status().sessions;
+    assert.equal(root.id, PARENT);
+    assert.equal(root.requests, 2);
+    assert.equal(root.inFlight, 0);
+    assert.equal(root.held, 0);
+    assert.deepEqual(root.agents.map(a => [a.id, a.type, a.requests]), [['a1', 'Explore', 1]]);
   } finally { proxy.close(); upstream.close(); fs.close(); }
 });
