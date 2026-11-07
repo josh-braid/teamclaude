@@ -317,6 +317,7 @@ export function schedulerText(s, now) {
   var dur = function (ms) {
     var minutes = Math.max(1, Math.round(ms / 60000));
     if (minutes < 60) return minutes + 'm';
+    if (minutes < 600) return Math.floor(minutes / 60) + 'h' + (minutes % 60 ? (minutes % 60) + 'm' : '');
     var hours = Math.round(minutes / 60);
     if (hours < 48) return hours + 'h';
     var days = Math.floor(hours / 24);

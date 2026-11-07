@@ -26,6 +26,13 @@ test('a projected limit before the reset is stated', () => {
   assert.match(String(schedulerText(s, NOW)), /hits its limit in ~14h, 2d before reset/);
 });
 
+test('a projection under ten hours keeps its minutes, so it never reads past the reset', () => {
+  // 1h32m to the limit, reset 21 minutes later: "~2h" would put the limit
+  // after a reset that is 1h53m away.
+  const s = { ...base, projectedLimitAt: NOW + 92 * 60_000, resetsAt: NOW + 113 * 60_000 };
+  assert.match(String(schedulerText(s, NOW)), /hits its limit in ~1h32m, 21m before reset/);
+});
+
 test('overdrive names how long and which sessions', () => {
   const s = { ...base, mode: 'overdrive', overdrive: { since: NOW - 180_000, sessions: ['a1b2c3d4-5555', 'e5f6a7b8-9999'] } };
   assert.equal(overdriveText(s, NOW), 'for 3m, driven by P1 a1b2c3d4, e5f6a7b8 · P2/P3 held');
