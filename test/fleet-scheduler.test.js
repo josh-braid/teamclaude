@@ -262,3 +262,13 @@ test('settling with the real usage teaches the estimator and corrects the bucket
   assert.equal(fs.status().committedTokens - before, 10 + 90 + 100);
   assert.equal(fs.estimator.sessions.get('s')?.outputTokens, 20);
 });
+
+test('an account first read after the window opened is learned from in that same window', () => {
+  const l = new ExchangeLearner({ windowMs: 5 * 60_000 });
+  const a = (u, input) => account({ tier: 'default_claude_ai', u7d: u, reset7d: 9e12, tokens: { input } });
+  // The scheduler's first look comes before any response has carried a reading.
+  l.observe(0, [account({ tier: 'default_claude_ai', u7d: null, reset7d: null })]);
+  l.observe(60_000, [a(0.10, 0)]);
+  l.observe(5 * 60_000 + 1, [a(0.20, 10_000)]);
+  assert.ok(Math.abs(/** @type {number} */ (l.quotaPerToken) - 0.1 / 10_000) < 1e-15, String(l.quotaPerToken));
+});

@@ -170,9 +170,10 @@ const LEARN_MAX_WINDOW_MS = 60 * 60_000;
  * How much weekly quota one weighted token moves, learned from the readings.
  *
  * A sample spans at least `windowMs`: readings move in coarse steps, and a
- * window shorter than one step reads as zero. It is taken only from accounts
- * whose weekly window did not reset inside it, and only once their utilization
- * has moved; a window that never moves is dropped after an hour.
+ * window shorter than one step reads as zero. An account that has no reading
+ * at the start of a window, or whose weekly window resets inside it, is counted
+ * from its next reading instead. A sample is taken once the utilization has
+ * moved; a window that never moves is dropped after an hour.
  */
 export class ExchangeLearner {
   /** @param {{ windowMs?: number }} [opts] */
@@ -191,14 +192,16 @@ export class ExchangeLearner {
   observe(now, accounts) {
     const snap = snapshot(now, accounts);
     if (!this.start) { this.start = snap; return; }
+    // An account new to this window, or one whose window reset, starts here.
+    for (const [id, end] of snap.accounts) {
+      const begin = this.start.accounts.get(id);
+      if (!begin || begin.reset !== end.reset || end.used < begin.used || end.tokens < begin.tokens) this.start.accounts.set(id, end);
+    }
     if (now - this.start.at < this.windowMs) return;
     let quota = 0;
     let tokens = 0;
-    let comparable = 0;
     for (const [id, end] of snap.accounts) {
-      const begin = this.start.accounts.get(id);
-      if (!begin || begin.reset !== end.reset || end.used < begin.used || end.tokens < begin.tokens) continue;
-      comparable++;
+      const begin = /** @type {{ used: number, tokens: number, weight: number }} */ (this.start.accounts.get(id));
       quota += end.weight * (end.used - begin.used);
       tokens += end.tokens - begin.tokens;
     }
@@ -206,7 +209,7 @@ export class ExchangeLearner {
       const sample = quota / tokens;
       this.quotaPerToken = this.quotaPerToken == null ? sample : this.quotaPerToken * (1 - LEARN_ALPHA) + sample * LEARN_ALPHA;
       this.start = snap;
-    } else if (comparable === 0 || now - this.start.at > LEARN_MAX_WINDOW_MS) {
+    } else if (now - this.start.at > LEARN_MAX_WINDOW_MS) {
       this.start = snap;
     }
   }
