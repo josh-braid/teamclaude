@@ -168,8 +168,10 @@ export function clearSelfProxyEnvLines(port, env = process.env) {
  * @param {string|null} [opts.account]
  * @param {string} [opts.proxyApiKey]
  * @param {string|null} [opts.inheritedNoProxy]
+ * @param {1|2|3|null} [opts.priority]  the scheduler level to ask for
+ * @param {string|null} [opts.inheritedCustomHeaders]  the shell's ANTHROPIC_CUSTOM_HEADERS, kept
  */
-export function buildClaudeEnvLines({ port, useMitm = true, caPath = null, holdSeconds = 0, account = null, proxyApiKey = '', inheritedNoProxy = null }) {
+export function buildClaudeEnvLines({ port, useMitm = true, caPath = null, holdSeconds = 0, account = null, proxyApiKey = '', inheritedNoProxy = null, priority = null, inheritedCustomHeaders = null }) {
   const lines = [];
   const pin = (account || '').trim();
   // The port is interpolated unquoted into URLs the shell evals, so it has to
@@ -203,12 +205,80 @@ export function buildClaudeEnvLines({ port, useMitm = true, caPath = null, holdS
   // The pin is now carried by the routing itself; keep it out of the child.
   if (pin) lines.push('unset TC_ACCT');
 
+  // The priority rides as a request header; TC_PRIORITY itself stays out of
+  // the child, like TC_ACCT.
+  if (priority != null) {
+    lines.push(`export ANTHROPIC_CUSTOM_HEADERS=${shellQuote(withPriorityHeader(inheritedCustomHeaders ?? undefined, priority))}`);
+    lines.push('unset TC_PRIORITY');
+  }
+
   // Parity with `run`: if the proxy may hold the connection on exhaustion, raise
   // the client-side timeout so it doesn't give up mid-hold.
   const holdMs = (holdSeconds || 0) * 1000;
   if (holdMs > 0) lines.push(`export API_TIMEOUT_MS=${holdMs + 60_000}`);
 
   return lines;
+}
+
+// The header the proxy's priority scheduler reads (server.js PRIORITY_HEADER).
+const PRIORITY_HEADER_NAME = 'x-teamclaude-priority';
+
+/**
+ * A `--priority N` / `--priority=N` flag taken out of `run`'s arguments.
+ * `level` is null when the flag is absent; `error` names a bad value.
+ * @param {string[]} args
+ * @returns {{ level: 1 | 2 | 3 | null, rest: string[], error: string | null }}
+ */
+export function takePriorityFlag(args) {
+  /** @type {string[]} */
+  const rest = [];
+  /** @type {string | null} */
+  let raw = null;
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a === '--priority') { raw = args[i + 1] ?? ''; i++; continue; }
+    if (a.startsWith('--priority=')) { raw = a.slice('--priority='.length); continue; }
+    rest.push(a);
+  }
+  if (raw == null) return { level: null, rest, error: null };
+  const level = parsePriority(raw);
+  return level == null
+    ? { level: null, rest, error: `--priority must be 1, 2 or 3, got ${JSON.stringify(raw)}` }
+    : { level, rest, error: null };
+}
+
+/**
+ * @param {unknown} raw
+ * @returns {1 | 2 | 3 | null}
+ */
+export function parsePriority(raw) {
+  const t = typeof raw === 'string' ? raw.trim() : '';
+  return t === '1' ? 1 : t === '2' ? 2 : t === '3' ? 3 : null;
+}
+
+/**
+ * Claude Code's ANTHROPIC_CUSTOM_HEADERS (one `Name: Value` per line) with the
+ * priority header set to `level`, replacing any earlier one and keeping every
+ * other header the caller set.
+ * @param {string | undefined} existing
+ * @param {1 | 2 | 3} level
+ */
+export function withPriorityHeader(existing, level) {
+  const kept = String(existing || '').split('\n')
+    .filter(line => line.trim() && line.split(':')[0].trim().toLowerCase() !== PRIORITY_HEADER_NAME);
+  return [...kept, `${PRIORITY_HEADER_NAME}: ${level}`].join('\n');
+}
+
+/**
+ * The longest the proxy may hold one request, in seconds: the exhaustion hold
+ * (`holdSeconds`) or, with the scheduler on, its `maxHoldSeconds`, whichever
+ * is longer. The client's timeout has to outlast it.
+ * @param {Record<string, any>} config
+ */
+export function clientHoldSeconds(config) {
+  const hold = Number(config?.holdSeconds) || 0;
+  const sched = config?.scheduler?.enabled === true ? (Number(config.scheduler.maxHoldSeconds) || 3600) : 0;
+  return Math.max(hold, sched);
 }
 
 // A claude that died within this long of launch did not get to a prompt.

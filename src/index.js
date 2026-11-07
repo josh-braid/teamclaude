@@ -47,7 +47,8 @@ import { renderStatus, formatPercent } from './status-renderer.js';
 import { sanitizeText, safeLine } from './safe-text.js';
 import { modelLabel } from './model.js';
 import { ClientUsageTracker, UsageDimensionTracker } from './client-usage.js';
-import { buildClaudeEnvLines, bypassesAllHosts, clearSelfProxyEnvLines, encodePinComponent, LOCAL_LOGIN_HINT_WINDOW_MS, localLoginHint, mergeNoProxy, resolveClientMode } from './claude-env.js';
+import { buildClaudeEnvLines, bypassesAllHosts, clearSelfProxyEnvLines, clientHoldSeconds, encodePinComponent, LOCAL_LOGIN_HINT_WINDOW_MS, localLoginHint, mergeNoProxy, parsePriority, resolveClientMode, takePriorityFlag, withPriorityHeader } from './claude-env.js';
+import { resolveSchedulerConfig } from './fleet-scheduler.js';
 import { serviceKind, installService, uninstallService, serviceStatus, renderService, logPath } from './service.js';
 import { formatTerminalTitle, titleSequence, TITLE_STACK_PUSH, TITLE_STACK_POP } from './terminal-title.js';
 import { getUpstreamProxy, describeProxy, describeSelfProxy, localListener, isSelfProxy } from './upstream-proxy.js';
@@ -382,6 +383,14 @@ async function serverCommand() {
     adaptive = validateAdaptiveConfig(config.adaptiveDistribution);
   } catch (err) {
     console.error(`[TeamClaude] Bad adaptiveDistribution setting in ${getConfigPath()}: ${err.message}`);
+    process.exit(1);
+  }
+  // Fatal for the same reason: a typo in the scheduler block would otherwise
+  // leave it running its defaults, or off, with nothing saying why.
+  try {
+    resolveSchedulerConfig(config.scheduler);
+  } catch (/** @type {any} */ err) {
+    console.error(`[TeamClaude] Bad scheduler setting in ${getConfigPath()}: ${err.message}`);
     process.exit(1);
   }
   const accountManager = new AccountManager(accounts, threshold, { routes: config.routes, ramp: config.stormRamp, distributeSessions: config.distributeSessions, expiryRouting: config.expiryRouting, advisorEligibility: config.advisorEligibility, adaptive, listener: localListener(config) });
@@ -1536,11 +1545,18 @@ async function envCommand() {
 
   // Same pin as `teamclaude run`, so `eval "$(teamclaude env)"` and `run` agree.
   const account = (process.env.TC_ACCT || '').trim();
+  // Same priority as `teamclaude run`, from TC_PRIORITY.
+  const priority = process.env.TC_PRIORITY ? parsePriority(process.env.TC_PRIORITY) : null;
+  if (process.env.TC_PRIORITY && priority == null) {
+    process.stderr.write(`teamclaude env: TC_PRIORITY must be 1, 2 or 3, got ${JSON.stringify(process.env.TC_PRIORITY)}\n`);
+    process.exit(1);
+  }
   let lines;
   try {
     lines = buildClaudeEnvLines({
-      port, useMitm, caPath, holdSeconds: config.holdSeconds,
+      port, useMitm, caPath, holdSeconds: clientHoldSeconds(config),
       account, proxyApiKey: config.proxy?.apiKey || '',
+      priority, inheritedCustomHeaders: process.env.ANTHROPIC_CUSTOM_HEADERS || null,
       // The shell doing the eval keeps its own NO_PROXY entries; re-running is
       // idempotent, since the merged value is what it will have next time.
       inheritedNoProxy: [process.env.NO_PROXY, process.env.no_proxy].filter(Boolean).join(','),
@@ -1600,9 +1616,17 @@ async function runCommand() {
     process.exit(1);
   }
   const autoFallback = tcFlags.includes('--auto-fallback');
+  // The scheduler priority: `--priority N` before any `--`, else TC_PRIORITY.
+  const priorityFlag = takePriorityFlag(tcFlags);
+  const priorityEnv = process.env.TC_PRIORITY ? parsePriority(process.env.TC_PRIORITY) : null;
+  if (priorityFlag.error || (process.env.TC_PRIORITY && priorityEnv == null && priorityFlag.level == null)) {
+    console.error(`[TeamClaude] ${priorityFlag.error || `TC_PRIORITY must be 1, 2 or 3, got ${JSON.stringify(process.env.TC_PRIORITY)}`}`);
+    process.exit(1);
+  }
+  const priority = priorityFlag.level ?? priorityEnv;
   const claudeArgs = sep >= 0
     ? rest.slice(sep + 1)
-    : rest.filter(a => a !== '--mitm' && a !== '--no-mitm' && a !== '--auto-fallback');
+    : priorityFlag.rest.filter(a => a !== '--mitm' && a !== '--no-mitm' && a !== '--auto-fallback');
 
   // Route through the proxy when it's up. When it's down we refuse by default —
   // silently launching claude directly hides that requests are bypassing the
@@ -1616,6 +1640,8 @@ async function runCommand() {
   // gets inherited by every tool and MCP server claude spawns.
   const tcAcct = (process.env.TC_ACCT || '').trim();
   delete env.TC_ACCT;
+  delete env.TC_PRIORITY;
+  if (priority != null) env.ANTHROPIC_CUSTOM_HEADERS = withPriorityHeader(env.ANTHROPIC_CUSTOM_HEADERS, priority);
   // Legacy: a caller-supplied ANTHROPIC_BASE_URL of http://<this proxy>/tc-acct/…
   // also pins (shipped in 1.1.10). TC_ACCT is the supported way now — it works in
   // MITM mode too, and keeps the pin out of the API path.
@@ -1681,7 +1707,8 @@ async function runCommand() {
   // cycle) so the client doesn't time out while we're still waiting.
   // Claude Code defaults API_TIMEOUT_MS to 600000ms (10 min) when unset, so
   // use that as the baseline to avoid accidentally lowering the timeout.
-  const holdMs = (config.holdSeconds || 0) * 1000;
+  // The scheduler's longest hold counts too (clientHoldSeconds).
+  const holdMs = clientHoldSeconds(config) * 1000;
   if (holdMs > 0) {
     const needed = holdMs + 60_000;
     const API_TIMEOUT_DEFAULT_MS = 600_000;
@@ -2986,6 +3013,8 @@ Options:
   --no-mitm           (run) skip the forward proxy; route via ANTHROPIC_BASE_URL only
   --auto-fallback     (run) if the proxy is down, launch claude directly instead
                       of erroring out (bypasses the proxy: no rotation)
+  --priority 1|2|3    (run) the scheduler level for this session: 1 is realtime
+                      and may overdrive, 3 waits behind 2 (see docs/scheduler.md)
 
 Environment:
   TC_ACCT             Pin a session to ONE account, bypassing rotation. Works in
@@ -2997,6 +3026,7 @@ Environment:
                       and 'env', then removed from the environment so it never
                       reaches claude or the tools it spawns. An unknown account
                       is refused rather than silently rotated.
+  TC_PRIORITY         The scheduler level, as --priority (read by 'run' and 'env')
   TEAMCLAUDE_CONFIG   Path to the config file (default below)
   TEAMCLAUDE_DISABLE_AUTOUPDATE=1
                       Skip the background self-update check

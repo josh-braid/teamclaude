@@ -15,7 +15,7 @@
 // operator/OAuth-derived, but they still never reach innerHTML.
 
 import { createHash } from 'node:crypto';
-import { UNAVAILABLE_TEXT, RESET_CREDIT_MAX_AGE_MS, outsideSpendText, forecastText, fleetForecastText, showSessionRow, showWeeklyRow } from './status-renderer.js';
+import { UNAVAILABLE_TEXT, RESET_CREDIT_MAX_AGE_MS, outsideSpendText, forecastText, fleetForecastText, schedulerText, overdriveText, showSessionRow, showWeeklyRow } from './status-renderer.js';
 import { USAGE_WINDOWS } from './client-usage.js';
 
 export function renderDashboardHtml() {
@@ -766,7 +766,7 @@ export const CARD_NOTE_MAX_AGE_MS = 60 * 1000;
 const SHARED_HELPERS = [
   scopedWeeklyRows, accountTokens, modelLabel, recentModelLabels, providerLabel, accountGroups, thresholdBadgeText, accountBadges, sessionRows, sessionPinsText, filterSessionRows, sortRows, uniqSorted,
   switchRequest, switchOutcome, accountControlRequest, accountControlOutcome, thresholdRequest, thresholdPercentText, thresholdOutcome, routeRows, problems, usageFor,
-  outsideSpendText, forecastText, fleetForecastText, showSessionRow, showWeeklyRow, callerCan, callerNotice, cardNoteKey, cardNoteFor, backendQuotaRows,
+  outsideSpendText, forecastText, fleetForecastText, schedulerText, overdriveText, showSessionRow, showWeeklyRow, callerCan, callerNotice, cardNoteKey, cardNoteFor, backendQuotaRows,
 ].map(fn => fn.toString()).join('\n\n');
 
 // The constants ride along: `problems` closes over the thresholds and
@@ -884,6 +884,7 @@ const PAGE = `<!doctype html>
   .ok { color: var(--ok); }
   .no { color: var(--dim); text-decoration: line-through; }
   .pin { color: var(--accent); font-size: 12px; }
+  .overdrive { color: var(--bad); font-weight: 600; }
   .warnt { color: var(--warn); font-size: 12px; }
   .badt { color: var(--bad); }
   #err { color: var(--bad); margin: 12px 0; display: none; }
@@ -1448,6 +1449,12 @@ ${SHARED_HELPERS}
     if (pinsText) sum.appendChild(el('span', 'pin', ' · ' + pinsText));
     var fleetText = fleetForecastText(s.fleetForecast, Date.now());
     if (fleetText) sum.appendChild(el('span', '', ' · ' + fleetText));
+    // The priority scheduler, only when it is on: its state on the summary
+    // line, and overdrive in the error colour so it cannot be missed.
+    var schedText = schedulerText(s.scheduler, Date.now());
+    if (schedText) sum.appendChild(el('span', '', ' · scheduler ' + schedText));
+    var odText = overdriveText(s.scheduler, Date.now());
+    if (odText) sum.appendChild(el('span', 'overdrive', ' · OVERDRIVE ' + odText));
     var probe = s.probe || {};
     var probeBtn = document.getElementById('probe');
     probeBtn.textContent = probe.running ? 'Probe running…' : 'Probe quotas';

@@ -59,3 +59,21 @@ test('already cancelled entry never acquires a permit; zero-length queue rejects
   assert.equal(await gate.enter(), false);
   gate.leave();
 });
+
+test('a bypass is admitted past the limit, and its permit retires instead of passing on', async () => {
+  const gate = new AdmissionGate(1, 4);
+  assert.equal(await gate.enter(), true);
+  const waiting = gate.enter();
+  assert.equal(await gate.enter({ bypass: true }), true);
+  assert.deepEqual(gate.status(), { active: 2, queued: 1, limit: 1, maxQueue: 4 });
+  // The first holder leaves while the bypass is still active: the gate is over
+  // its limit, so the waiter stays queued.
+  gate.leave();
+  assert.deepEqual(gate.status(), { active: 1, queued: 1, limit: 1, maxQueue: 4 });
+  // The bypass leaves: now the permit passes to the waiter.
+  gate.leave();
+  assert.equal(await waiting, true);
+  assert.deepEqual(gate.status(), { active: 1, queued: 0, limit: 1, maxQueue: 4 });
+  gate.leave();
+  assert.equal(gate.status().active, 0);
+});

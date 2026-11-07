@@ -7,6 +7,10 @@
 // it — so a departed client frees its slot for whoever is behind it. Every
 // admitted caller must `leave()` exactly once; `leave()` hands the permit
 // straight to the oldest waiter when there is one.
+//
+// `bypass` admits at once even past the limit, for work that must not queue
+// behind the rest (the scheduler's realtime level). It still counts as active,
+// so it holds a permit like any other caller until it leaves.
 export const DEFAULT_MAX_QUEUE = 64;
 export const DEFAULT_QUEUE_TIMEOUT_MS = 5_000;
 
@@ -23,10 +27,10 @@ export class AdmissionGate {
     this.queue = [];
   }
 
-  /** @param {{ signal?: AbortSignal, timeoutMs?: number }} [opts] */
-  enter({ signal, timeoutMs = DEFAULT_QUEUE_TIMEOUT_MS } = {}) {
+  /** @param {{ signal?: AbortSignal, timeoutMs?: number, bypass?: boolean }} [opts] */
+  enter({ signal, timeoutMs = DEFAULT_QUEUE_TIMEOUT_MS, bypass = false } = {}) {
     if (signal?.aborted) return Promise.resolve(false);
-    if (this.active < this.limit) {
+    if (bypass || this.active < this.limit) {
       this.active += 1;
       return Promise.resolve(true);
     }
@@ -50,6 +54,9 @@ export class AdmissionGate {
   }
 
   leave() {
+    // Over the limit (a bypass is active): this permit retires rather than
+    // passing on, so the gate returns to its limit before it admits a waiter.
+    if (this.active > this.limit) { this.active -= 1; return; }
     const next = this.queue.shift();
     if (next) next(true); // transfer this permit; active does not change
     else if (this.active > 0) this.active -= 1;

@@ -59,6 +59,11 @@ export function renderStatus(status, { color = process.stdout.isTTY, now = Date.
   // Only when the fleet runs out within the forecast horizon (#550).
   const fleetForecast = fleetForecastText(status.fleetForecast, now);
   if (fleetForecast) lines.push(`${paint.dim('Fleet'.padEnd(12))} ${paint.yellow(fleetForecast)}`);
+  // Only with the priority scheduler on (docs/scheduler.md).
+  const scheduler = schedulerText(status.scheduler, now);
+  if (scheduler) lines.push(`${paint.dim('Scheduler'.padEnd(12))} ${scheduler}`);
+  const overdrive = overdriveText(status.scheduler, now);
+  if (overdrive) lines.push(`${paint.dim('Overdrive'.padEnd(12))} ${paint.red(overdrive)}`);
   lines.push('');
 
   for (const line of routingLines(status.routes, blocked, paint)) lines.push(line);
@@ -291,6 +296,75 @@ export function fleetForecastText(fleet, now) {
     text += out ? ', first back ' + dur(back - fleet.allOutAt) + ' later' : ', first back in ' + dur(back - now);
   }
   return text;
+}
+
+/**
+ * The priority scheduler's state in one line, or null when it is off:
+ *
+ *   "paced · 12.3k tok/min · P3 3 waiting (oldest 4m)"
+ *   "recovering · repaying 1.20% of fleet quota · P2/P3 resume in ~6m"
+ *   "passthrough (no quota-per-token rate learned yet)"
+ *
+ * Pure and closure-free, like fleetForecastText, so the dashboard can reuse it.
+ *
+ * @param {any} s  the status payload's `scheduler`
+ * @param {number} now  ms epoch
+ * @returns {string|null}
+ */
+export function schedulerText(s, now) {
+  if (!s || s.enabled !== true) return null;
+  /** @param {number} ms */
+  var dur = function (ms) {
+    var minutes = Math.max(1, Math.round(ms / 60000));
+    if (minutes < 60) return minutes + 'm';
+    var hours = Math.round(minutes / 60);
+    if (hours < 48) return hours + 'h';
+    var days = Math.floor(hours / 24);
+    var rem = hours % 24;
+    return rem ? days + 'd' + rem + 'h' : days + 'd';
+  };
+  /** @param {number} n */
+  var num = function (n) {
+    if (n >= 1e6) return (n / 1e6).toFixed(1) + 'M';
+    if (n >= 1e3) return (n / 1e3).toFixed(1) + 'k';
+    return String(Math.round(n));
+  };
+  if (s.mode === 'passthrough') return 'passthrough (no quota-per-token rate learned yet)';
+  var parts = [String(s.mode)];
+  if (s.pace && typeof s.pace.tokensPerMinute === 'number') parts.push(num(s.pace.tokensPerMinute) + ' tok/min');
+  if (s.mode === 'recovering' || s.mode === 'overdrive') {
+    var pct = ((s.debt && s.debt.fractionOfFleet) || 0) * 100;
+    parts.push((s.mode === 'overdrive' ? 'in debt by ' : 'repaying ') + pct.toFixed(2) + '% of fleet quota');
+    if (s.mode === 'recovering' && s.debt && typeof s.debt.clearsAt === 'number') parts.push('P2/P3 resume in ~' + dur(s.debt.clearsAt - now));
+  }
+  var queued = s.queued || {};
+  var waits = s.oldestWaitMs || {};
+  [2, 3].forEach(function (level) {
+    var n = queued[level] || 0;
+    if (n > 0) parts.push('P' + level + ' ' + n + ' waiting' + (typeof waits[level] === 'number' ? ' (oldest ' + dur(waits[level]) + ')' : ''));
+  });
+  if (typeof s.projectedLimitAt === 'number' && typeof s.resetsAt === 'number' && s.projectedLimitAt > now) {
+    parts.push('at this rate the fleet hits its limit in ~' + dur(s.projectedLimitAt - now) + ', ' + dur(s.resetsAt - s.projectedLimitAt) + ' before reset');
+  }
+  return parts.join(' · ');
+}
+
+/**
+ * The overdrive line, or null when the scheduler is not in overdrive:
+ *
+ *   "for 3m, driven by P1 a1b2c3d4, e5f6a7b8 · P2/P3 held"
+ *
+ * Pure and closure-free, like schedulerText.
+ *
+ * @param {any} s  the status payload's `scheduler`
+ * @param {number} now  ms epoch
+ * @returns {string|null}
+ */
+export function overdriveText(s, now) {
+  if (!s || s.enabled !== true || !s.overdrive) return null;
+  var minutes = Math.max(1, Math.round((now - s.overdrive.since) / 60000));
+  var sessions = (s.overdrive.sessions || []).map(function (/** @type {unknown} */ id) { return String(id).replace(/[^\w-]/g, '').slice(0, 8); });
+  return 'for ' + minutes + 'm' + (sessions.length ? ', driven by P1 ' + sessions.join(', ') : '') + ' · P2/P3 held';
 }
 
 /**

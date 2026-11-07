@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import { spawnSync } from 'node:child_process';
 import assert from 'node:assert/strict';
-import { buildClaudeEnvLines, bypassesAllHosts, clearSelfProxyEnvLines, localLoginHint, mergeNoProxy, resolveClientMode } from '../src/claude-env.js';
+import { buildClaudeEnvLines, bypassesAllHosts, clearSelfProxyEnvLines, clientHoldSeconds, localLoginHint, mergeNoProxy, resolveClientMode, takePriorityFlag, withPriorityHeader } from '../src/claude-env.js';
 
 test('MITM mode (default) emits proxy vars + CA cert, and clears ANTHROPIC_BASE_URL', () => {
   const lines = buildClaudeEnvLines({ port: 3456, caPath: '/home/u/.config/teamclaude-ca.pem' });
@@ -208,4 +208,35 @@ test('the local-login hint fires for a missing or stale login and not for a live
   assert.match(await localLoginHint({ read: async () => ({ accessToken: 'a', refreshToken: 'r', expiresAt: Date.now() - 1 }), expired }), /Claude Code's own login.*claude auth login/);
   assert.equal(await localLoginHint({ read: async () => ({ accessToken: 'a', refreshToken: 'r', expiresAt: Date.now() + 3600_000 }), expired }), null);
   assert.equal(await localLoginHint({ read: async () => ({ accessToken: 'a', refreshToken: 'r' }), expired }), null, 'no expiry recorded is not evidence');
+});
+
+// ── scheduler priority ──────────────────────────────────────────────────────
+
+test('takePriorityFlag reads --priority N and --priority=N and leaves the rest', () => {
+  assert.deepEqual(takePriorityFlag(['--no-mitm', '--priority', '1', '-p', 'hi']), { level: 1, rest: ['--no-mitm', '-p', 'hi'], error: null });
+  assert.deepEqual(takePriorityFlag(['--priority=3']), { level: 3, rest: [], error: null });
+  assert.deepEqual(takePriorityFlag(['-p', 'hi']), { level: null, rest: ['-p', 'hi'], error: null });
+  assert.match(String(takePriorityFlag(['--priority', '4']).error), /1, 2 or 3/);
+  assert.match(String(takePriorityFlag(['--priority']).error), /1, 2 or 3/);
+});
+
+test('withPriorityHeader replaces an earlier priority and keeps other headers', () => {
+  assert.equal(withPriorityHeader(undefined, 2), 'x-teamclaude-priority: 2');
+  assert.equal(withPriorityHeader('X-Team: a\nX-TeamClaude-Priority: 3\n', 1), 'X-Team: a\nx-teamclaude-priority: 1');
+});
+
+test('clientHoldSeconds covers the scheduler hold only when the scheduler is on', () => {
+  assert.equal(clientHoldSeconds({}), 0);
+  assert.equal(clientHoldSeconds({ holdSeconds: 120 }), 120);
+  assert.equal(clientHoldSeconds({ holdSeconds: 120, scheduler: { enabled: false, maxHoldSeconds: 900 } }), 120);
+  assert.equal(clientHoldSeconds({ holdSeconds: 120, scheduler: { enabled: true, maxHoldSeconds: 900 } }), 900);
+  assert.equal(clientHoldSeconds({ scheduler: { enabled: true } }), 3600);
+});
+
+test('buildClaudeEnvLines sets the priority header and keeps TC_PRIORITY out of the child', () => {
+  const lines = buildClaudeEnvLines({ port: 3456, useMitm: false, priority: 1, inheritedCustomHeaders: 'X-Team: a' });
+  assert.ok(lines.includes(`export ANTHROPIC_CUSTOM_HEADERS='X-Team: a\nx-teamclaude-priority: 1'`), lines.join('\n'));
+  assert.ok(lines.includes('unset TC_PRIORITY'));
+  const none = buildClaudeEnvLines({ port: 3456, useMitm: false });
+  assert.ok(!none.some(l => /CUSTOM_HEADERS|TC_PRIORITY/.test(l)));
 });

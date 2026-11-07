@@ -21,6 +21,8 @@ import { accountRefusal, isRefused } from './account-refusal.js';
 import { applyAuthHeaders, upstreamFor, rewritesBody, defaultHeadersTimeoutFor, providerForPath, providerForHost, interceptHostsFor, providerOf, isSubscriptionAccount, canServeProvider, DEFAULT_PROVIDER, PROVIDERS } from './provider.js';
 import { tunnelTls } from './sx.js';
 import { createEgressGuard } from './egress-guard.js';
+import { FleetScheduler, resolveSchedulerConfig } from './fleet-scheduler.js';
+import { parseLevel } from './scheduler.js';
 import { createDrainState, DRAIN_RETRY_AFTER_SECONDS } from './drain.js';
 import { isRoutingFailure, describeRouting } from './account-routing.js';
 import { safeLine } from './safe-text.js';
@@ -569,6 +571,8 @@ const CLIENT_KEY_REFUSED_PATHS = new Map([
   // Not a config write, but it names a session and moves it: one tenant must
   // not be able to put another tenant's session on an account of its choosing.
   ['/teamclaude/session-pin', 'a client key cannot pin sessions'],
+  // A tenant must not raise its own sessions, or lower another tenant's.
+  ['/teamclaude/session-priority', 'a client key cannot change session priority'],
   // Drain stops new traffic for the whole proxy, which is the operator's call.
   ['/teamclaude/drain', 'a client key cannot drain the proxy'],
   ['/teamclaude/undrain', 'a client key cannot drain the proxy'],
@@ -800,7 +804,7 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
         res.writeHead(200, { 'Content-Type': 'application/json' });
         // Counters only: how full the upstream admission gate is (see
         // upstream-fetch.js), never which origins or requests.
-        res.end(JSON.stringify({ ...extra, ...status, caller: callerView(req.tcClient, auth.scope), upstreamPool: upstreamPoolStatus(), drain: drain.status() }, null, 2));
+        res.end(JSON.stringify({ ...extra, ...status, caller: callerView(req.tcClient, auth.scope), upstreamPool: upstreamPoolStatus(), drain: drain.status(), ...(scheduler.enabled ? { scheduler: scheduler.status() } : {}) }, null, 2));
         return;
       }
 
@@ -810,7 +814,8 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
       if (req.method === 'GET' && req.url === '/teamclaude/quota') {
         const extra = hooks.getQuotaExtra?.() || {};
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ ...accountManager.getQuotaSummary(), ...extra }, null, 2));
+        const schedulerView = scheduler.quotaView();
+        res.end(JSON.stringify({ ...accountManager.getQuotaSummary(), ...extra, ...(schedulerView ? { scheduler: schedulerView } : {}) }, null, 2));
         return;
       }
 
@@ -1060,6 +1065,45 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
         return;
       }
 
+      // Session priority — run one client session at P1, P2 or P3 whatever its
+      // own header says (scheduler.js). Body: {"sessionId": "<x-claude-code-
+      // session-id>", "priority": 1 | 2 | 3 | null}; null clears the override.
+      // Runtime only, like the session pin.
+      if (req.method === 'POST' && req.url === '/teamclaude/session-priority') {
+        let body;
+        try {
+          body = JSON.parse((await readControlBody(req)) || '{}');
+        } catch (/** @type {any} */ err) {
+          const tooLarge = err.message === 'body too large';
+          res.writeHead(tooLarge ? 413 : 400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: tooLarge ? 'request body too large' : 'invalid request body' }));
+          return;
+        }
+        const sessionId = body?.sessionId;
+        if (typeof sessionId !== 'string' || !SESSION_ID_SHAPE.test(sessionId)) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'missing or malformed "sessionId"' }));
+          return;
+        }
+        const level = body.priority === null ? null : parseLevel(body.priority);
+        if (body.priority !== null && level == null) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: '"priority" must be 1, 2 or 3 (null clears the override)' }));
+          return;
+        }
+        if (!scheduler.enabled) {
+          res.writeHead(409, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'the scheduler is off (set scheduler.enabled in the config)' }));
+          return;
+        }
+        scheduler.setSessionPriority(sessionId, level);
+        const seen = accountManager.sessionTracker.knowsSession(sessionId);
+        console.log(`[TeamClaude] Session ${sessionId.slice(0, 8)} ${level == null ? 'priority override cleared' : `set to P${level}`} (manual)`);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, sessionId, priority: level, seen }));
+        return;
+      }
+
       // Threshold endpoint — the utilization at which rotation leaves an
       // account, the web equivalent of `teamclaude threshold <1-100>` and of the
       // set_threshold MCP tool. Unlike /switch, which only moves currentIndex in
@@ -1211,7 +1255,11 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
   // Opt-in egress pin: null unless config.egress.pin is set, and then shared by
   // the base listener and the MITM one so both honour the same hold.
   const egress = createEgressGuard(config, logLine);
-  const forward = createProxyRequestListener({ accountManager, upstream, logDir, hooks, sx, holdMs, config, egress, clientUsage, dimensionUsage, drain });
+  // The priority scheduler (fleet-scheduler.js), shared by the base listener and
+  // the MITM one so both draw on one pace. Off unless config.scheduler.enabled;
+  // a bad block is refused at startup (index.js), before this is reached.
+  const scheduler = new FleetScheduler({ config: resolveSchedulerConfig(config.scheduler), accountManager });
+  const forward = createProxyRequestListener({ accountManager, upstream, logDir, hooks, sx, holdMs, config, egress, clientUsage, dimensionUsage, drain, scheduler });
   const server = http.createServer(requestHandler);
   server.keepAliveTimeout = KEEP_ALIVE_TIMEOUT_MS;
 
@@ -1253,7 +1301,8 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
     const c = await certsPromise;
     return { key: c.leafKeyPem, cert: c.leafCertPem };
   };
-  server.on('connect', createConnectHandler({ config, accountManager, ensureLeaf, logDir, hooks, log: logLine, sx, egress, clientUsage, dimensionUsage, drain }));
+  server.on('connect', createConnectHandler({ config, accountManager, ensureLeaf, logDir, hooks, log: logLine, sx, egress, clientUsage, dimensionUsage, drain, scheduler }));
+  server.on('close', () => scheduler.close());
   // Remote Control's real-time channel is a WebSocket, not a request/response
   // call — Node fires 'upgrade' for that handshake, never 'request', so it
   // needs its own listener (base-URL routing path; the MITM path wires the
@@ -1700,6 +1749,8 @@ export function clientSessionId(headers) {
 // caller's when it is a plain token, and a fresh UUID otherwise. It is for
 // correlation only: never identity, never a dedup key, never a routing input.
 export const CORRELATION_HEADER = 'x-teamclaude-request-id';
+// The priority a client asks for (scheduler.js): 1, 2 or 3. Never forwarded.
+export const PRIORITY_HEADER = 'x-teamclaude-priority';
 const CALLER_REQUEST_ID = /^[A-Za-z0-9._:-]{1,128}$/;
 
 /**
@@ -1734,8 +1785,9 @@ let lastRequestId = 0;
  * @param {string|null} [opts.forcedClient]
  * @param {Object|null} [opts.dimensionUsage]
  * @param {import('./drain.js').DrainState|null} [opts.drain]  the shared drain state (drain.js); a listener made without one keeps its own, which never drains
+ * @param {import('./fleet-scheduler.js').FleetScheduler|null} [opts.scheduler]  the priority scheduler (fleet-scheduler.js); none, or one that is off, holds nothing
  */
-export function createProxyRequestListener({ accountManager, upstream, logDir = null, hooks = {}, sx = null, holdMs = 0, config = {}, forcedPin = null, egress = null, clientUsage = null, forcedClient = null, dimensionUsage = null, drain = null }) {
+export function createProxyRequestListener({ accountManager, upstream, logDir = null, hooks = {}, sx = null, holdMs = 0, config = {}, forcedPin = null, egress = null, clientUsage = null, forcedClient = null, dimensionUsage = null, drain = null, scheduler = null }) {
   const drainState = drain ?? createDrainState();
   return async (req, res) => {
     // Set before anything else, so every response from this listener carries the
@@ -1829,6 +1881,9 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       // one account, bypassing rotation. Used by the keep-warm scheduler and for
       // manual per-account testing. The prefix is stripped before forwarding.
       let pinnedIndex = null;
+      // A path-prefix pin is the warmer's and manual testing's channel; those
+      // requests go straight out rather than through the priority scheduler.
+      let urlPinned = false;
       // DEPRECATED: the path-prefix pin. Superseded by TC_ACCT, which works in
       // MITM mode too (this form cannot — inside a CONNECT tunnel the path is
       // the real upstream one). Kept for the warmer and for direct API callers.
@@ -1862,6 +1917,7 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
           return;
         }
         req.url = afterPrefix.slice(tokenEnd);
+        urlPinned = true;
       }
 
       // Remote Control (/v1/code/*) is bound to the session's paired claude.ai
@@ -2050,11 +2106,16 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       // internal project and branch names to Anthropic for no benefit, so they
       // are dropped with the other proxy-control headers.
       const stripHeaders = usageDimensionHeaderNames(config.proxy);
+      // Ours too: it tells this proxy's scheduler, not Anthropic, what to do.
+      stripHeaders.add(PRIORITY_HEADER);
 
       // stripOverage, synthesizeQuota and poolQuota are sampled once here, at dispatch:
       // retries and holds of this request keep them, and a reload applies to
       // subsequent requests.
-      const ctx = { account: null, callerRequestId: callerId, status: null, attempt: 0, tried: new Set(), reauthed: new Set(), model, advisorModel, streamRequested: parseRequestStream(body), fleetMessageThreads: config?.messageThreads === true, pinnedIndex, provider, holdBudgetMs: holdMs, pinKey, onMessage, client, delivered: false, abandoned: false, onUsage: usageRecorder.onUsage, stripHeaders, stripOverage: shouldStripOverageHeaders(config), synthesizeQuota: shouldSynthesizeQuotaHeaders(config), poolQuota: shouldPoolQuotaHeaders(config), logLevel: resolveLogLevel(config), logMaxBodyBytes: resolveLogMaxBodyBytes(config) };
+      const ctx = { account: /** @type {string|null} */ (null), callerRequestId: callerId, status: /** @type {number|null} */ (null), attempt: 0, tried: new Set(), reauthed: new Set(), model, advisorModel, streamRequested: parseRequestStream(body), fleetMessageThreads: config?.messageThreads === true, pinnedIndex, provider, holdBudgetMs: holdMs, pinKey, onMessage, client, delivered: false, abandoned: false, onUsage: usageRecorder.onUsage, stripHeaders, stripOverage: shouldStripOverageHeaders(config), synthesizeQuota: shouldSynthesizeQuotaHeaders(config), poolQuota: shouldPoolQuotaHeaders(config), logLevel: resolveLogLevel(config), logMaxBodyBytes: resolveLogMaxBodyBytes(config),
+        // Set below: the departure signal, and the scheduler's level and usage reports.
+        signal: /** @type {AbortSignal|undefined} */ (undefined), priority: /** @type {1|2|3|null} */ (null),
+        usageReports: /** @type {Array<Record<string, unknown>>|null} */ (null), onUsageReport: /** @type {((usage: Record<string, unknown>) => void)|null} */ (null) };
       // Hold the session "in flight" across the WHOLE request (incl. retries and
       // a multi-minute streaming completion) so it stays counted as active and
       // never expires mid-request.
@@ -2080,7 +2141,34 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       ctx.signal = requestAbort.signal;
       res.once('close', onRequestClose);
       if (clientGone(res)) onRequestClose();
+      /** @type {import('./fleet-scheduler.js').Admission | null} */
+      let admission = null;
       try {
+        // The priority scheduler: an Anthropic completion waits here until the
+        // fleet's pace admits it. Nothing is held when it is off.
+        if (scheduler?.enabled && !urlPinned && provider === DEFAULT_PROVIDER && isCompletionPath(classifiedPath)) {
+          const level = scheduler.levelFor(sessionId, req.headers[PRIORITY_HEADER]);
+          ctx.priority = level;
+          const result = await scheduler.admit({ session: sessionId || pinKey || 'anonymous', level, bodyBytes: body.length, signal: ctx.signal });
+          if (result.kind === 'gone') return;
+          if (result.kind === 'timeout') {
+            ctx.status = 429;
+            ctx.account = `(held: P${level})`;
+            res.writeHead(429, { 'Content-Type': 'application/json', 'retry-after': String(result.retryAfterSeconds) });
+            res.end(JSON.stringify({
+              type: 'error',
+              error: {
+                type: 'rate_limit_error',
+                message: `teamclaude held this P${level} request for the fleet's pace and gave up after scheduler.maxHoldSeconds; retry in ${result.retryAfterSeconds}s.`,
+                details: { error_code: 'scheduler_hold_expired' },
+              },
+            }));
+            return;
+          }
+          admission = result;
+          const reports = ctx.usageReports = /** @type {Array<Record<string, unknown>>} */ ([]);
+          ctx.onUsageReport = (/** @type {Record<string, unknown>} */ usage) => { reports.push({ ...usage }); };
+        }
         await forwardRequest(req, res, body, accountManager, upstream, 0, hooks, reqId, ctx, logDir, sx);
       } catch (err) {
         ctx.status = ctx.status || 502;
@@ -2094,6 +2182,7 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
           res.end(JSON.stringify({ type: 'error', error: { type: 'proxy_error', message: 'Internal proxy error' } }));
         }
       } finally {
+        if (admission?.kind === 'admitted') scheduler?.settle(admission, ctx.usageReports || []);
         res.off('close', onRequestClose);
         // The signal fires only for a departure (see above), so this is the
         // status of a row whose client will never read anything. It says
@@ -3930,6 +4019,9 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
         // Cancels the admission wait and the request itself when the client
         // goes away (see the listener's AbortController).
         signal: ctx.signal,
+        // A realtime (P1) request takes a connection even past the per-origin
+        // cap, rather than queueing behind lower-priority traffic.
+        bypassAdmission: ctx.priority === 1,
         // This account's own egress proxy, when the operator pinned one
         // (accounts[].routing): every attempt for the account — this one, and
         // any failover that lands back on it — leaves through that proxy, and
@@ -4568,7 +4660,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       const l = getLog();
       const bw = l ? l.bodyWriter('RESPONSE BODY (streamed)', contentType) : null;
       try {
-        await streamResponse(upstreamBody, res, account.index, accountManager, bw, ctx.onUsage, ctx.pinKey, ctx.model, ctx.onMessage);
+        await streamResponse(upstreamBody, res, account.index, accountManager, bw, ctx.onUsage, ctx.pinKey, ctx.model, ctx.onMessage, ctx.onUsageReport);
         // Reached only when the stream completed. A stream that dies upstream
         // throws out of streamResponse, so it never marks itself delivered —
         // which is the failure the token counters cannot see, since a stream
@@ -4583,7 +4675,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       l?.end();
     } else {
       const buf = await buffer(upstreamBody);
-      extractUsageFromBody(buf, account.index, accountManager, ctx.onUsage, ctx.pinKey, ctx.model, ctx.onMessage);
+      extractUsageFromBody(buf, account.index, accountManager, ctx.onUsage, ctx.pinKey, ctx.model, ctx.onMessage, ctx.onUsageReport);
       const l = getLog();
       if (l) { l.body('RESPONSE BODY', buf, contentType); l.end(); }
       res.end(buf);
@@ -4765,7 +4857,7 @@ export function readWithIdleTimeout(reader, ms) {
 /**
  * Stream an SSE response to the client, parsing usage data along the way.
  */
-export async function streamResponse(webStream, res, accountIndex, accountManager, bodyWriter, onUsage = null, pinKey = null, model = null, onMessage = null) {
+export async function streamResponse(webStream, res, accountIndex, accountManager, bodyWriter, onUsage = null, pinKey = null, model = null, onMessage = null, /** @type {((usage: Record<string, unknown>) => void)|null} */ onUsageReport = null) {
   const reader = webStream.getReader();
   // A client that leaves while upstream is silent must not hold the pending
   // read — and with it the upstream socket and its admission permit — until
@@ -4780,6 +4872,7 @@ export async function streamResponse(webStream, res, accountIndex, accountManage
   const decoder = new TextDecoder();
   let errored = false;
   // The message's usage, merged across its two reports and recorded once below.
+  /** @type {Record<string, unknown>} */
   const merged = {};
   // A Responses turn settles both sides on ONE terminal event, so this stream
   // remembers that it did — the incremental counters would book the turn again
@@ -4847,6 +4940,7 @@ export async function streamResponse(webStream, res, accountIndex, accountManage
     // and recording those would report an observation that never happened.
     if (Object.keys(merged).length) {
       accountManager.recordTokenUsage(accountIndex, pinKey, model, merged);
+      onUsageReport?.(merged);
     }
     // Cancel upstream reader to stop consuming data nobody needs (and, on the
     // timeout path, to destroy the dead socket so the pool drops it).
@@ -4985,8 +5079,9 @@ function parseSSEDataLine(line, accountIndex, accountManager, onUsage = null, me
  * @param {string|null} [pinKey]
  * @param {string|null} [model]
  * @param {((messageId: string) => void)|null} [onMessage] told the id of the message the body is
+ * @param {((usage: Record<string, unknown>) => void)|null} [onUsageReport] told the whole usage report
  */
-function extractUsageFromBody(buffer, accountIndex, accountManager, onUsage = null, pinKey = null, model = null, onMessage = null) {
+function extractUsageFromBody(buffer, accountIndex, accountManager, onUsage = null, pinKey = null, model = null, onMessage = null, onUsageReport = null) {
   try {
     const json = JSON.parse(buffer.toString());
     if (json?.type === 'message' && typeof json.id === 'string') onMessage?.(json.id);
@@ -5004,6 +5099,7 @@ function extractUsageFromBody(buffer, accountIndex, accountManager, onUsage = nu
       accountManager.updateUsage(accountIndex, usage.input_tokens, usage.output_tokens);
       onUsage?.(usage.input_tokens || 0, usage.output_tokens || 0);
       accountManager.recordTokenUsage(accountIndex, pinKey, model, usage);
+      onUsageReport?.(usage);
     }
   } catch {
     // not JSON or no usage

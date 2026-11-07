@@ -141,11 +141,11 @@ function headersTimeoutError(ms) {
 // attempt — including a post-429 retry — goes through that account's proxy.
 /** @param {Record<string, any>} [opts] */
 export function upstreamFetch(url, opts = {}, sx = null, useProxy = false) {
-  const { headersTimeoutMs, defaultHeadersTimeoutMs, queueTimeoutMs, routing, ...fetchOpts } = opts;
+  const { headersTimeoutMs, defaultHeadersTimeoutMs, queueTimeoutMs, bypassAdmission, routing, ...fetchOpts } = opts;
   const timeoutMs = resolveHeadersTimeout(headersTimeoutMs, defaultHeadersTimeoutMs);
   // The admission wait is a per-call option of the node:http paths only; the
   // global-fetch escape hatch is not gated (it has no socket pool to protect).
-  const nodeOpts = queueTimeoutMs == null ? fetchOpts : { ...fetchOpts, queueTimeoutMs };
+  const nodeOpts = { ...fetchOpts, ...(queueTimeoutMs == null ? {} : { queueTimeoutMs }), ...(bypassAdmission ? { bypassAdmission: true } : {}) };
   if (routing) return pooledFetch(url, { ...nodeOpts, routing }, timeoutMs);
   if (sx && useProxy && sx.isProvisioned()) return proxiedFetch(url, nodeOpts, sx, timeoutMs);
   // The global-fetch escape hatch cannot speak CONNECT (that is why the tunnel
@@ -261,7 +261,7 @@ async function nodeRequest(u, opts, timeoutMs, { transport, agent }) {
     admissionByOrigin.set(u.origin, gate);
   }
   const forget = () => { if (!gate.active && !gate.queue.length && admissionByOrigin.get(u.origin) === gate) admissionByOrigin.delete(u.origin); };
-  const admitted = await gate.enter({ signal: opts.signal, timeoutMs: opts.queueTimeoutMs ?? QUEUE_TIMEOUT_MS });
+  const admitted = await gate.enter({ signal: opts.signal, timeoutMs: opts.queueTimeoutMs ?? QUEUE_TIMEOUT_MS, bypass: opts.bypassAdmission === true });
   if (!admitted) {
     forget();
     if (opts.signal?.aborted) throw opts.signal.reason ?? new Error('aborted');
